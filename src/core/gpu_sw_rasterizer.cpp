@@ -7,6 +7,8 @@
 #include "cpuinfo.h"
 
 #include "common/log.h"
+#include "common/string_util.h"
+
 Log_SetChannel(GPU_SW_Rasterizer);
 
 namespace GPU_SW_Rasterizer {
@@ -39,6 +41,13 @@ namespace GPU_SW_Rasterizer {
 #include "gpu_sw_rasterizer.inl"
 }
 
+// Default vector implementation definitions.
+#if defined(CPU_ARCH_SSE) || defined(CPU_ARCH_NEON)
+namespace GPU_SW_Rasterizer::Vector {
+#include "gpu_sw_rasterizer.inl"
+}
+#endif
+
 // Initialize with default implementation.
 namespace GPU_SW_Rasterizer {
 const DrawRectangleFunctionTable* SelectedDrawRectangleFunctions = &DrawRectangleFunctions;
@@ -49,4 +58,40 @@ const DrawLineFunctionTable* SelectedDrawLineFunctions = &DrawLineFunctions;
 // Declare alternative implementations.
 void GPU_SW_Rasterizer::SelectImplementation()
 {
+  static bool selected = false;
+  if (selected)
+    return;
+
+  selected = true;
+
+#define SELECT_ALTERNATIVE_RASTERIZER(isa)                                                                             \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    INFO_LOG("* Using " #isa " software rasterizer implementation.");                                                  \
+    SelectedDrawRectangleFunctions = &isa::DrawRectangleFunctions;                                                     \
+    SelectedDrawTriangleFunctions = &isa::DrawTriangleFunctions;                                                       \
+    SelectedDrawLineFunctions = &isa::DrawLineFunctions;                                                               \
+  } while (0)
+
+#if defined(CPU_ARCH_SSE) || defined(CPU_ARCH_NEON)
+  const char* use_isa = std::getenv("SW_USE_ISA");
+
+#ifdef CPU_ARCH_SSE
+  if (cpuinfo_has_x86_avx2() && (!use_isa || StringUtil::Strcasecmp(use_isa, "AVX2") == 0))
+  {
+    SELECT_ALTERNATIVE_RASTERIZER(AVX2);
+    return;
+  }
+#endif
+
+  if (!use_isa || StringUtil::Strcasecmp(use_isa, "Vector") == 0)
+  {
+    SELECT_ALTERNATIVE_RASTERIZER(Vector);
+    return;
+  }
+#endif
+
+  INFO_LOG("* Using scalar software rasterizer implementation.");
+
+#undef SELECT_ALTERNATIVE_RASTERIZER
 }

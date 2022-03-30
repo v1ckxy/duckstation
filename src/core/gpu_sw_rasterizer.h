@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
 // SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
 
 #pragma once
@@ -6,6 +7,7 @@
 #include "gpu.h"
 #include "gpu_types.h"
 
+#include "common/intrin.h"
 #include "common/types.h"
 
 #include <algorithm>
@@ -32,6 +34,11 @@ typedef const DrawTriangleFunction DrawTriangleFunctionTable[2][2][2][2][2];
 using DrawLineFunction = void (*)(const GPUBackendDrawLineCommand* cmd, const GPUBackendDrawLineCommand::Vertex* p0,
                                   const GPUBackendDrawLineCommand::Vertex* p1);
 typedef const DrawLineFunction DrawLineFunctionTable[2][2][2];
+
+// Default implementation, compatible with all ISAs.
+extern const DrawRectangleFunctionTable DrawRectangleFunctions;
+extern const DrawTriangleFunctionTable DrawTriangleFunctions;
+extern const DrawLineFunctionTable DrawLineFunctions;
 
 // Current implementation, selected at runtime.
 extern const DrawRectangleFunctionTable* SelectedDrawRectangleFunctions;
@@ -60,4 +67,24 @@ ALWAYS_INLINE static DrawTriangleFunction GetDrawTriangleFunction(bool shading_e
                                          [u8(transparency_enable)][u8(dithering_enable)];
 }
 
+#define DECLARE_ALTERNATIVE_RASTERIZER(isa)                                                                            \
+  namespace isa {                                                                                                      \
+  extern const DrawRectangleFunctionTable DrawRectangleFunctions;                                                      \
+  extern const DrawTriangleFunctionTable DrawTriangleFunctions;                                                        \
+  extern const DrawLineFunctionTable DrawLineFunctions;                                                                \
+  }
+
+// Have to define the symbols globally, because clang won't include them otherwise.
+#if defined(CPU_ARCH_SSE)
+#define ALTERNATIVE_RASTERIZER_LIST() DECLARE_ALTERNATIVE_RASTERIZER(AVX2)
+#else
+#define ALTERNATIVE_RASTERIZER_LIST()
+#endif
+
+ALTERNATIVE_RASTERIZER_LIST()
+
+#undef DECLARE_ALTERNATIVE_RASTERIZER
+
 } // namespace GPU_SW_Rasterizer
+
+// static u32 s_bad_counter = 0;
