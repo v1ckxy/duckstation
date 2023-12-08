@@ -809,7 +809,7 @@ ALWAYS_INLINE_RELEASE static void AddIDeltas_DY(i_group& ig, const i_deltas& idl
 
 template<bool shading_enable, bool texture_enable, bool raw_texture_enable, bool transparency_enable,
          bool dithering_enable>
-ALWAYS_INLINE_RELEASE static void DrawSpan(const GPUBackendDrawPolygonCommand* cmd, s32 y, s32 x_start, s32 x_bound,
+ALWAYS_INLINE_RELEASE static void DrawSpan(const GPUBackendDrawCommand* cmd, s32 y, s32 x_start, s32 x_bound,
                                            i_group ig, const i_deltas& idl)
 {
   if (cmd->params.interlaced_rendering && cmd->params.active_line_lsb == (Truncate8(static_cast<u32>(y)) & 1u))
@@ -988,7 +988,7 @@ ALWAYS_INLINE_RELEASE static void DrawSpan(const GPUBackendDrawCommand* cmd, s32
 
 template<bool shading_enable, bool texture_enable, bool raw_texture_enable, bool transparency_enable,
          bool dithering_enable>
-static void DrawTriangle(const GPUBackendDrawPolygonCommand* cmd, const GPUBackendDrawPolygonCommand::Vertex* v0,
+static void DrawTriangle(const GPUBackendDrawCommand* cmd, const GPUBackendDrawPolygonCommand::Vertex* v0,
                          const GPUBackendDrawPolygonCommand::Vertex* v1, const GPUBackendDrawPolygonCommand::Vertex* v2)
 {
 #if 0

@@ -28,14 +28,11 @@ class GPUDevice;
 class GPUTexture;
 class GPUPipeline;
 
+class GPUBackend;
 struct Settings;
 class TimingEvent;
 
-namespace Threading {
-class Thread;
-}
-
-class GPU
+class GPU final
 {
 public:
   enum class BlitterState : u8
@@ -60,7 +57,6 @@ public:
     DOT_TIMER_INDEX = 0,
     HBLANK_TIMER_INDEX = 1,
     MAX_RESOLUTION_SCALE = 32,
-    DEINTERLACE_BUFFER_COUNT = 4,
     DRAWING_AREA_COORD_MASK = 1023,
   };
 
@@ -86,25 +82,14 @@ public:
 
   // Base class constructor.
   GPU();
-  virtual ~GPU();
+  ~GPU();
 
-  virtual const Threading::Thread* GetSWThread() const = 0;
-  virtual bool IsHardwareRenderer() const = 0;
-
-  virtual bool Initialize();
-  virtual void Reset(bool clear_vram);
-  virtual bool DoState(StateWrapper& sw, GPUTexture** save_to_texture, bool update_display);
-
-  // Graphics API state reset/restore - call when drawing the UI etc.
-  // TODO: replace with "invalidate cached state"
-  virtual void RestoreDeviceContext();
+  void Initialize();
+  void Reset(bool clear_vram);
+  bool DoState(StateWrapper& sw, GPUTexture** save_to_texture, bool update_display);
 
   // Render statistics debug window.
   void DrawDebugStateWindow();
-  void GetStatsString(SmallStringBase& str);
-  void GetMemoryStatsString(SmallStringBase& str);
-  void ResetStatistics();
-  void UpdateStatistics(u32 frame_count);
 
   void CPUClockChanged();
 
@@ -160,23 +145,11 @@ public:
   void SynchronizeCRTC();
 
   /// Recompile shaders/recreate framebuffers when needed.
-  virtual void UpdateSettings(const Settings& old_settings);
-
-  /// Updates the resolution scale when it's set to automatic.
-  virtual void UpdateResolutionScale();
-
-  /// Returns the effective display resolution of the GPU.
-  virtual std::tuple<u32, u32> GetEffectiveDisplayResolution(bool scaled = true);
-
-  /// Returns the full display resolution of the GPU, including padding.
-  virtual std::tuple<u32, u32> GetFullDisplayResolution(bool scaled = true);
+  void UpdateSettings(const Settings& old_settings);
 
   float ComputeHorizontalFrequency() const;
   float ComputeVerticalFrequency() const;
   float ComputeDisplayAspectRatio() const;
-
-  static std::unique_ptr<GPU> CreateHardwareRenderer();
-  static std::unique_ptr<GPU> CreateSoftwareRenderer();
 
   // Converts window coordinates into horizontal ticks and scanlines. Returns false if out of range. Used for lightguns.
   void ConvertScreenCoordinatesToDisplayCoordinates(float window_x, float window_y, float* display_x,
@@ -203,30 +176,7 @@ public:
   // Dumps raw VRAM to a file.
   bool DumpVRAMToFile(const char* filename);
 
-  // Ensures all buffered vertices are drawn.
-  virtual void FlushRender() = 0;
-
-  /// Helper function for computing the draw rectangle in a larger window.
-  GSVector4i CalculateDrawRect(s32 window_width, s32 window_height, bool apply_aspect_ratio = true) const;
-
-  /// Helper function to save current display texture to PNG.
-  bool WriteDisplayTextureToFile(std::string filename, bool compress_on_thread = false);
-
-  /// Renders the display, optionally with postprocessing to the specified image.
-  bool RenderScreenshotToBuffer(u32 width, u32 height, const GSVector4i draw_rect, bool postfx,
-                                std::vector<u32>* out_pixels, u32* out_stride, GPUTexture::Format* out_format);
-
-  /// Helper function to save screenshot to PNG.
-  bool RenderScreenshotToFile(std::string filename, DisplayScreenshotMode mode, u8 quality, bool compress_on_thread,
-                              bool show_osd_message);
-
-  /// Draws the current display texture, with any post-processing.
-  bool PresentDisplay();
-
-  /// Reads the CLUT from the specified coordinates, accounting for wrap-around.
-  static void ReadCLUT(u16* dest, GPUTexturePaletteReg reg, bool clut_is_8bit);
-
-protected:
+private:
   TickCount CRTCTicksToSystemTicks(TickCount crtc_ticks, TickCount fractional_ticks) const;
   TickCount SystemTicksToCRTCTicks(TickCount sysclk_ticks, TickCount* fractional_ticks) const;
 
@@ -236,16 +186,6 @@ protected:
     return std::max<TickCount>((gpu_ticks + 1) >> 1, 1);
   }
   ALWAYS_INLINE static constexpr TickCount SystemTicksToGPUTicks(TickCount sysclk_ticks) { return sysclk_ticks << 1; }
-
-  static constexpr std::tuple<u8, u8> UnpackTexcoord(u16 texcoord)
-  {
-    return std::make_tuple(static_cast<u8>(texcoord), static_cast<u8>(texcoord >> 8));
-  }
-
-  static constexpr std::tuple<u8, u8, u8> UnpackColorRGB24(u32 rgb24)
-  {
-    return std::make_tuple(static_cast<u8>(rgb24), static_cast<u8>(rgb24 >> 8), static_cast<u8>(rgb24 >> 16));
-  }
 
   static bool DumpVRAMToFile(const char* filename, u32 width, u32 height, u32 stride, const void* buffer,
                              bool remove_alpha);
@@ -270,10 +210,10 @@ protected:
   void CommandTickEvent(TickCount ticks);
 
   /// Returns 0 if the currently-displayed field is on odd lines (1,3,5,...) or 1 if even (2,4,6,...).
-  ALWAYS_INLINE u32 GetInterlacedDisplayField() const { return ZeroExtend32(m_crtc_state.interlaced_field); }
+  ALWAYS_INLINE u8 GetInterlacedDisplayField() const { return m_crtc_state.interlaced_field; }
 
   /// Returns 0 if the currently-displayed field is on an even line in VRAM, otherwise 1.
-  ALWAYS_INLINE u32 GetActiveLineLSB() const { return ZeroExtend32(m_crtc_state.active_line_lsb); }
+  ALWAYS_INLINE u8 GetActiveLineLSB() const { return m_crtc_state.active_line_lsb; }
 
   /// Updates drawing area that's suitablef or clamping.
   void SetClampedDrawingArea();
@@ -308,16 +248,15 @@ protected:
   void InvalidateCLUT();
   bool IsCLUTValid() const;
 
-  // Rendering in the backend
-  virtual void ReadVRAM(u32 x, u32 y, u32 width, u32 height);
-  virtual void FillVRAM(u32 x, u32 y, u32 width, u32 height, u32 color);
-  virtual void UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, bool set_mask, bool check_mask);
-  virtual void CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height);
-  virtual void DispatchRenderCommand() = 0;
-  virtual void UpdateCLUT(GPUTexturePaletteReg reg, bool clut_is_8bit) = 0;
-  virtual void UpdateDisplay() = 0;
-  virtual void DrawRendererStats();
-  virtual void OnBufferSwapped();
+  void ReadVRAM(u16 x, u16 y, u16 width, u16 height);
+  void UpdateVRAM(u16 x, u16 y, u16 width, u16 height, const void* data, bool set_mask, bool check_mask);
+
+  void UpdateDisplay(bool present_frame);
+
+  void PrepareForDraw();
+  void FinishPolyline();
+  void FillBackendCommandParameters(GPUBackendCommand* cmd) const;
+  void FillDrawCommand(GPUBackendDrawCommand* cmd, GPURenderCommand rc) const;
 
   ALWAYS_INLINE_RELEASE void AddDrawTriangleTicks(GSVector2i v1, GSVector2i v2, GSVector2i v3, bool shaded,
                                                   bool textured, bool semitransparent)
@@ -443,19 +382,10 @@ protected:
     u32 texture_window_value;
 
     // decoded values
+    // TODO: Make this a command
     GPUTextureWindow texture_window;
     bool texture_x_flip;
     bool texture_y_flip;
-    bool texture_page_changed;
-    bool texture_window_changed;
-
-    ALWAYS_INLINE bool IsTexturePageChanged() const { return texture_page_changed; }
-    ALWAYS_INLINE void SetTexturePageChanged() { texture_page_changed = true; }
-    ALWAYS_INLINE void ClearTexturePageChangedFlag() { texture_page_changed = false; }
-
-    ALWAYS_INLINE bool IsTextureWindowChanged() const { return texture_window_changed; }
-    ALWAYS_INLINE void SetTextureWindowChanged() { texture_window_changed = true; }
-    ALWAYS_INLINE void ClearTextureWindowChangedFlag() { texture_window_changed = false; }
   } m_draw_mode = {};
 
   GPUDrawingArea m_drawing_area = {};
@@ -587,64 +517,7 @@ protected:
   TickCount m_max_run_ahead = 128;
   u32 m_fifo_size = 128;
 
-  void ClearDisplayTexture();
-  void SetDisplayTexture(GPUTexture* texture, GPUTexture* depth_texture, s32 view_x, s32 view_y, s32 view_width,
-                         s32 view_height);
-
-  bool RenderDisplay(GPUTexture* target, const GSVector4i draw_rect, bool postfx);
-
-  bool Deinterlace(u32 field, u32 line_skip);
-  bool DeinterlaceExtractField(u32 dst_bufidx, GPUTexture* src, u32 x, u32 y, u32 width, u32 height, u32 line_skip);
-  bool DeinterlaceSetTargetSize(u32 width, u32 height, bool preserve);
-  void DestroyDeinterlaceTextures();
-  bool ApplyChromaSmoothing();
-
-  u32 m_current_deinterlace_buffer = 0;
-  std::unique_ptr<GPUPipeline> m_deinterlace_pipeline;
-  std::unique_ptr<GPUPipeline> m_deinterlace_extract_pipeline;
-  std::array<std::unique_ptr<GPUTexture>, DEINTERLACE_BUFFER_COUNT> m_deinterlace_buffers;
-  std::unique_ptr<GPUTexture> m_deinterlace_texture;
-
-  std::unique_ptr<GPUPipeline> m_chroma_smoothing_pipeline;
-  std::unique_ptr<GPUTexture> m_chroma_smoothing_texture;
-
-  std::unique_ptr<GPUPipeline> m_display_pipeline;
-  GPUTexture* m_display_texture = nullptr;
-  GPUTexture* m_display_depth_buffer = nullptr;
-  s32 m_display_texture_view_x = 0;
-  s32 m_display_texture_view_y = 0;
-  s32 m_display_texture_view_width = 0;
-  s32 m_display_texture_view_height = 0;
-
-  struct Counters
-  {
-    u32 num_reads;
-    u32 num_writes;
-    u32 num_copies;
-    u32 num_vertices;
-    u32 num_primitives;
-
-    // u32 num_read_texture_updates;
-    // u32 num_ubo_updates;
-  };
-
-  struct Stats : Counters
-  {
-    size_t host_buffer_streamed;
-    u32 host_num_draws;
-    u32 host_num_barriers;
-    u32 host_num_render_passes;
-    u32 host_num_copies;
-    u32 host_num_downloads;
-    u32 host_num_uploads;
-  };
-
-  Counters m_counters = {};
-  Stats m_stats = {};
-
 private:
-  bool CompileDisplayPipelines(bool display, bool deinterlace, bool chroma_smoothing);
-
   using GP0CommandHandler = bool (GPU::*)();
   using GP0CommandHandlerTable = std::array<GP0CommandHandler, 256>;
   static GP0CommandHandlerTable GenerateGP0CommandHandlerTable();

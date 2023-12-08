@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
 
 #include "gpu_sw.h"
+#include "gpu.h"
+#include "gpu_sw_rasterizer.h"
 #include "system.h"
 
 #include "util/gpu_device.h"
 
 #include "common/align.h"
 #include "common/assert.h"
-#include "common/gsvector.h"
-#include "common/gsvector_formatter.h"
+#include "common/intrin.h"
 #include "common/log.h"
 
 #include <algorithm>
@@ -18,27 +19,141 @@ Log_SetChannel(GPU_SW);
 
 GPU_SW::GPU_SW() = default;
 
-GPU_SW::~GPU_SW()
-{
-  g_gpu_device->RecycleTexture(std::move(m_upload_texture));
-  m_backend.Shutdown();
-}
+GPU_SW::~GPU_SW() = default;
 
-const Threading::Thread* GPU_SW::GetSWThread() const
+bool GPU_SW::Initialize(bool clear_vram, Error* error)
 {
-  return m_backend.GetThread();
-}
-
-bool GPU_SW::IsHardwareRenderer() const
-{
-  return false;
-}
-
-bool GPU_SW::Initialize()
-{
-  if (!GPU::Initialize() || !m_backend.Initialize(false))
+  if (!GPUBackend::Initialize(clear_vram, error))
     return false;
 
+  GPU_SW_Rasterizer::SelectImplementation();
+
+  // if we're using "new" vram, clear it out here
+  if (clear_vram)
+    std::memset(g_vram, 0, sizeof(g_vram));
+
+  SetDisplayTextureFormat();
+  return true;
+}
+
+bool GPU_SW::DoState(GPUTexture** host_texture, bool is_reading, bool update_display)
+{
+  // TODO: FIXME
+  // ignore the host texture for software mode, since we want to save vram here
+  return true;
+}
+
+void GPU_SW::ClearVRAM()
+{
+  std::memset(g_vram, 0, sizeof(g_vram));
+  std::memset(g_gpu_clut, 0, sizeof(g_gpu_clut));
+}
+
+std::tuple<u32, u32> GPU_SW::GetEffectiveDisplayResolution(bool scaled /* = true */) const
+{
+  return std::tie(m_display_vram_width, m_display_vram_height);
+}
+
+std::tuple<u32, u32> GPU_SW::GetFullDisplayResolution(bool scaled /* = true */) const
+{
+  return std::tie(m_display_width, m_display_height);
+}
+
+void GPU_SW::UpdateResolutionScale()
+{
+}
+
+void GPU_SW::ReadVRAM(u32 x, u32 y, u32 width, u32 height)
+{
+}
+
+void GPU_SW::DrawPolygon(const GPUBackendDrawPolygonCommand* cmd)
+{
+  const GPURenderCommand rc{cmd->rc.bits};
+  const bool dithering_enable = rc.IsDitheringEnabled() && cmd->draw_mode.dither_enable;
+
+  const GPU_SW_Rasterizer::DrawTriangleFunction DrawFunction = GPU_SW_Rasterizer::GetDrawTriangleFunction(
+    rc.shading_enable, rc.texture_enable, rc.raw_texture_enable, rc.transparency_enable, dithering_enable);
+
+  DrawFunction(cmd, &cmd->vertices[0], &cmd->vertices[1], &cmd->vertices[2]);
+  if (rc.quad_polygon)
+    DrawFunction(cmd, &cmd->vertices[2], &cmd->vertices[1], &cmd->vertices[3]);
+}
+
+void GPU_SW::DrawPrecisePolygon(const GPUBackendDrawPrecisePolygonCommand* cmd)
+{
+  const GPURenderCommand rc{cmd->rc.bits};
+  const bool dithering_enable = rc.IsDitheringEnabled() && cmd->draw_mode.dither_enable;
+
+  const GPU_SW_Rasterizer::DrawTriangleFunction DrawFunction = GPU_SW_Rasterizer::GetDrawTriangleFunction(
+    rc.shading_enable, rc.texture_enable, rc.raw_texture_enable, rc.transparency_enable, dithering_enable);
+
+  // Need to cut out the irrelevant bits.
+  // TODO: In _theory_ we could use the fixed-point parts here.
+  GPUBackendDrawPolygonCommand::Vertex vertices[4];
+  for (u32 i = 0; i < cmd->num_vertices; i++)
+  {
+    const GPUBackendDrawPrecisePolygonCommand::Vertex& src = cmd->vertices[i];
+    GPUBackendDrawPolygonCommand::Vertex& dst = vertices[i];
+
+    dst.x = src.native_x;
+    dst.y = src.native_y;
+    dst.color = src.color;
+    dst.texcoord = src.texcoord;
+  }
+
+  DrawFunction(cmd, &vertices[0], &vertices[1], &vertices[2]);
+  if (rc.quad_polygon)
+    DrawFunction(cmd, &vertices[2], &vertices[1], &vertices[3]);
+}
+
+void GPU_SW::DrawSprite(const GPUBackendDrawRectangleCommand* cmd)
+{
+  const GPURenderCommand rc{cmd->rc.bits};
+
+  const GPU_SW_Rasterizer::DrawRectangleFunction DrawFunction =
+    GPU_SW_Rasterizer::GetDrawRectangleFunction(rc.texture_enable, rc.raw_texture_enable, rc.transparency_enable);
+
+  DrawFunction(cmd);
+}
+
+void GPU_SW::DrawLine(const GPUBackendDrawLineCommand* cmd)
+{
+  const GPU_SW_Rasterizer::DrawLineFunction DrawFunction = GPU_SW_Rasterizer::GetDrawLineFunction(
+    cmd->rc.shading_enable, cmd->rc.transparency_enable, cmd->IsDitheringEnabled());
+
+  for (u16 i = 1; i < cmd->num_vertices; i++)
+    DrawFunction(cmd, &cmd->vertices[i - 1], &cmd->vertices[i]);
+}
+
+void GPU_SW::DrawingAreaChanged(const GPUDrawingArea& new_drawing_area, const GSVector4i clamped_drawing_area)
+{
+  GPU_SW_Rasterizer::g_drawing_area = new_drawing_area;
+}
+
+void GPU_SW::ClearCache()
+{
+}
+
+void GPU_SW::UpdateCLUT(GPUTexturePaletteReg reg, bool clut_is_8bit)
+{
+  GPU_SW_Rasterizer::UpdateCLUT(reg, clut_is_8bit);
+}
+
+void GPU_SW::OnBufferSwapped()
+{
+}
+
+void GPU_SW::FlushRender()
+{
+}
+
+void GPU_SW::RestoreDeviceContext()
+{
+}
+
+void GPU_SW::SetDisplayTextureFormat()
+{
   static constexpr const std::array formats_for_16bit = {GPUTexture::Format::RGB565, GPUTexture::Format::RGBA5551,
                                                          GPUTexture::Format::RGBA8, GPUTexture::Format::BGRA8};
   static constexpr const std::array formats_for_24bit = {GPUTexture::Format::RGBA8, GPUTexture::Format::BGRA8,
@@ -59,32 +174,7 @@ bool GPU_SW::Initialize()
       break;
     }
   }
-
-  return true;
 }
-
-bool GPU_SW::DoState(StateWrapper& sw, GPUTexture** host_texture, bool update_display)
-{
-  // need to ensure the worker thread is done
-  m_backend.Sync(true);
-
-  // ignore the host texture for software mode, since we want to save vram here
-  return GPU::DoState(sw, nullptr, update_display);
-}
-
-void GPU_SW::Reset(bool clear_vram)
-{
-  GPU::Reset(clear_vram);
-
-  m_backend.Reset();
-}
-
-void GPU_SW::UpdateSettings(const Settings& old_settings)
-{
-  GPU::UpdateSettings(old_settings);
-  m_backend.UpdateSettings();
-}
-
 GPUTexture* GPU_SW::GetDisplayTexture(u32 width, u32 height, GPUTexture::Format format)
 {
   if (!m_upload_texture || m_upload_texture->GetWidth() != width || m_upload_texture->GetHeight() != height ||
@@ -420,32 +510,28 @@ bool GPU_SW::CopyOut(u32 src_x, u32 src_y, u32 skip_x, u32 width, u32 height, u3
   }
 }
 
-void GPU_SW::UpdateDisplay()
+void GPU_SW::UpdateDisplay(const GPUBackendUpdateDisplayCommand* cmd)
 {
-  // fill display texture
-  m_backend.Sync(true);
-
   if (!g_settings.debugging.show_vram)
   {
-    if (IsDisplayDisabled())
+    if (cmd->display_disabled)
     {
       ClearDisplayTexture();
       return;
     }
 
-    const bool is_24bit = m_GPUSTAT.display_area_color_depth_24;
-    const bool interlaced = IsInterlacedDisplayEnabled();
-    const u32 field = GetInterlacedDisplayField();
-    const u32 vram_offset_x = is_24bit ? m_crtc_state.regs.X : m_crtc_state.display_vram_left;
-    const u32 vram_offset_y =
-      m_crtc_state.display_vram_top + ((interlaced && m_GPUSTAT.vertical_resolution) ? field : 0);
-    const u32 skip_x = is_24bit ? (m_crtc_state.display_vram_left - m_crtc_state.regs.X) : 0;
-    const u32 read_width = m_crtc_state.display_vram_width;
-    const u32 read_height = interlaced ? (m_crtc_state.display_vram_height / 2) : m_crtc_state.display_vram_height;
+    const bool is_24bit = cmd->display_24bit;
+    const bool interlaced = cmd->interlaced_display_enabled;
+    const u32 field = cmd->interlaced_display_field;
+    const u32 vram_offset_x = is_24bit ? cmd->X : cmd->display_vram_left;
+    const u32 vram_offset_y = cmd->display_vram_top + ((interlaced && cmd->interlaced_display_interleaved) ? field : 0);
+    const u32 skip_x = is_24bit ? (cmd->display_vram_left - cmd->X) : 0;
+    const u32 read_width = cmd->display_vram_width;
+    const u32 read_height = interlaced ? (cmd->display_vram_height / 2) : cmd->display_vram_height;
 
-    if (IsInterlacedDisplayEnabled())
+    if (cmd->interlaced_display_enabled)
     {
-      const u32 line_skip = m_GPUSTAT.vertical_resolution;
+      const u32 line_skip = cmd->interlaced_display_interleaved;
       if (CopyOut(vram_offset_x, vram_offset_y, skip_x, read_width, read_height, line_skip, is_24bit))
       {
         SetDisplayTexture(m_upload_texture.get(), nullptr, 0, 0, read_width, read_height);
@@ -477,336 +563,7 @@ void GPU_SW::UpdateDisplay()
   }
 }
 
-void GPU_SW::FillBackendCommandParameters(GPUBackendCommand* cmd) const
+std::unique_ptr<GPUBackend> GPUBackend::CreateSoftwareBackend()
 {
-  cmd->params.bits = 0;
-  cmd->params.check_mask_before_draw = m_GPUSTAT.check_mask_before_draw;
-  cmd->params.set_mask_while_drawing = m_GPUSTAT.set_mask_while_drawing;
-  cmd->params.active_line_lsb = m_crtc_state.active_line_lsb;
-  cmd->params.interlaced_rendering = IsInterlacedRenderingEnabled();
-}
-
-void GPU_SW::FillDrawCommand(GPUBackendDrawCommand* cmd, GPURenderCommand rc) const
-{
-  FillBackendCommandParameters(cmd);
-  cmd->rc.bits = rc.bits;
-  cmd->draw_mode.bits = m_draw_mode.mode_reg.bits;
-  cmd->palette.bits = m_draw_mode.palette_reg.bits;
-  cmd->window = m_draw_mode.texture_window;
-}
-
-void GPU_SW::DispatchRenderCommand()
-{
-  if (m_drawing_area_changed)
-  {
-    GPUBackendSetDrawingAreaCommand* cmd = m_backend.NewSetDrawingAreaCommand();
-    cmd->new_area = m_drawing_area;
-    GSVector4i::store<false>(cmd->new_clamped_area, m_clamped_drawing_area);
-    m_backend.PushCommand(cmd);
-    m_drawing_area_changed = false;
-  }
-
-  const GPURenderCommand rc{m_render_command.bits};
-
-  switch (rc.primitive)
-  {
-    case GPUPrimitive::Polygon:
-    {
-      const u32 num_vertices = rc.quad_polygon ? 4 : 3;
-      GPUBackendDrawPolygonCommand* cmd = m_backend.NewDrawPolygonCommand(num_vertices);
-      FillDrawCommand(cmd, rc);
-
-      std::array<GSVector2i, 4> positions;
-      const u32 first_color = rc.color_for_first_vertex;
-      const bool shaded = rc.shading_enable;
-      const bool textured = rc.texture_enable;
-      for (u32 i = 0; i < num_vertices; i++)
-      {
-        GPUBackendDrawPolygonCommand::Vertex* vert = &cmd->vertices[i];
-        vert->color = (shaded && i > 0) ? (FifoPop() & UINT32_C(0x00FFFFFF)) : first_color;
-        const u64 maddr_and_pos = m_fifo.Pop();
-        const GPUVertexPosition vp{Truncate32(maddr_and_pos)};
-        vert->x = m_drawing_offset.x + vp.x;
-        vert->y = m_drawing_offset.y + vp.y;
-        vert->texcoord = textured ? Truncate16(FifoPop()) : 0;
-        positions[i] = GSVector2i::load(&vert->x);
-      }
-
-      // Cull polygons which are too large.
-      const GSVector2i min_pos_12 = positions[1].min_i32(positions[2]);
-      const GSVector2i max_pos_12 = positions[1].max_i32(positions[2]);
-      const GSVector4i draw_rect_012 = GSVector4i(min_pos_12.min_i32(positions[0]))
-                                         .upl64(GSVector4i(max_pos_12.max_i32(positions[0])))
-                                         .add32(GSVector4i::cxpr(0, 0, 1, 1));
-      const bool first_tri_culled =
-        (draw_rect_012.width() > MAX_PRIMITIVE_WIDTH || draw_rect_012.height() > MAX_PRIMITIVE_HEIGHT ||
-         !m_clamped_drawing_area.rintersects(draw_rect_012));
-      if (first_tri_culled)
-      {
-        DEBUG_LOG("Culling off-screen/too-large polygon: {},{} {},{} {},{}", cmd->vertices[0].x, cmd->vertices[0].y,
-                  cmd->vertices[1].x, cmd->vertices[1].y, cmd->vertices[2].x, cmd->vertices[2].y);
-
-        if (!rc.quad_polygon)
-          return;
-      }
-      else
-      {
-        AddDrawTriangleTicks(positions[0], positions[1], positions[2], rc.shading_enable, rc.texture_enable,
-                             rc.transparency_enable);
-      }
-
-      // quads
-      if (rc.quad_polygon)
-      {
-        const GSVector4i draw_rect_123 = GSVector4i(min_pos_12.min_i32(positions[3]))
-                                           .upl64(GSVector4i(max_pos_12.max_i32(positions[3])))
-                                           .add32(GSVector4i::cxpr(0, 0, 1, 1));
-
-        // Cull polygons which are too large.
-        const bool second_tri_culled =
-          (draw_rect_123.width() > MAX_PRIMITIVE_WIDTH || draw_rect_123.height() > MAX_PRIMITIVE_HEIGHT ||
-           !m_clamped_drawing_area.rintersects(draw_rect_123));
-        if (second_tri_culled)
-        {
-          DEBUG_LOG("Culling too-large polygon (quad second half): {},{} {},{} {},{}", cmd->vertices[2].x,
-                    cmd->vertices[2].y, cmd->vertices[1].x, cmd->vertices[1].y, cmd->vertices[0].x, cmd->vertices[0].y);
-
-          if (first_tri_culled)
-            return;
-        }
-        else
-        {
-          AddDrawTriangleTicks(positions[2], positions[1], positions[3], rc.shading_enable, rc.texture_enable,
-                               rc.transparency_enable);
-        }
-      }
-
-      m_backend.PushCommand(cmd);
-    }
-    break;
-
-    case GPUPrimitive::Rectangle:
-    {
-      GPUBackendDrawRectangleCommand* cmd = m_backend.NewDrawRectangleCommand();
-      FillDrawCommand(cmd, rc);
-      cmd->color = rc.color_for_first_vertex;
-
-      const GPUVertexPosition vp{FifoPop()};
-      cmd->x = TruncateGPUVertexPosition(m_drawing_offset.x + vp.x);
-      cmd->y = TruncateGPUVertexPosition(m_drawing_offset.y + vp.y);
-
-      if (rc.texture_enable)
-      {
-        const u32 texcoord_and_palette = FifoPop();
-        cmd->palette.bits = Truncate16(texcoord_and_palette >> 16);
-        cmd->texcoord = Truncate16(texcoord_and_palette);
-      }
-      else
-      {
-        cmd->palette.bits = 0;
-        cmd->texcoord = 0;
-      }
-
-      switch (rc.rectangle_size)
-      {
-        case GPUDrawRectangleSize::R1x1:
-          cmd->width = 1;
-          cmd->height = 1;
-          break;
-        case GPUDrawRectangleSize::R8x8:
-          cmd->width = 8;
-          cmd->height = 8;
-          break;
-        case GPUDrawRectangleSize::R16x16:
-          cmd->width = 16;
-          cmd->height = 16;
-          break;
-        default:
-        {
-          const u32 width_and_height = FifoPop();
-          cmd->width = static_cast<u16>(width_and_height & VRAM_WIDTH_MASK);
-          cmd->height = static_cast<u16>((width_and_height >> 16) & VRAM_HEIGHT_MASK);
-        }
-        break;
-      }
-
-      const GSVector4i rect = GSVector4i(cmd->x, cmd->y, cmd->x + cmd->width, cmd->y + cmd->height);
-      const GSVector4i clamped_rect = m_clamped_drawing_area.rintersect(rect);
-      if (clamped_rect.rempty()) [[unlikely]]
-      {
-        DEBUG_LOG("Culling off-screen rectangle {}", rect);
-        return;
-      }
-
-      AddDrawRectangleTicks(clamped_rect, rc.texture_enable, rc.transparency_enable);
-
-      m_backend.PushCommand(cmd);
-    }
-    break;
-
-    case GPUPrimitive::Line:
-    {
-      if (!rc.polyline)
-      {
-        GPUBackendDrawLineCommand* cmd = m_backend.NewDrawLineCommand(2);
-        FillDrawCommand(cmd, rc);
-        cmd->palette.bits = 0;
-
-        if (rc.shading_enable)
-        {
-          cmd->vertices[0].color = rc.color_for_first_vertex;
-          const GPUVertexPosition start_pos{FifoPop()};
-          cmd->vertices[0].x = m_drawing_offset.x + start_pos.x;
-          cmd->vertices[0].y = m_drawing_offset.y + start_pos.y;
-
-          cmd->vertices[1].color = FifoPop() & UINT32_C(0x00FFFFFF);
-          const GPUVertexPosition end_pos{FifoPop()};
-          cmd->vertices[1].x = m_drawing_offset.x + end_pos.x;
-          cmd->vertices[1].y = m_drawing_offset.y + end_pos.y;
-        }
-        else
-        {
-          cmd->vertices[0].color = rc.color_for_first_vertex;
-          cmd->vertices[1].color = rc.color_for_first_vertex;
-
-          const GPUVertexPosition start_pos{FifoPop()};
-          cmd->vertices[0].x = m_drawing_offset.x + start_pos.x;
-          cmd->vertices[0].y = m_drawing_offset.y + start_pos.y;
-
-          const GPUVertexPosition end_pos{FifoPop()};
-          cmd->vertices[1].x = m_drawing_offset.x + end_pos.x;
-          cmd->vertices[1].y = m_drawing_offset.y + end_pos.y;
-        }
-
-        const GSVector4i v0 = GSVector4i::loadl(&cmd->vertices[0].x);
-        const GSVector4i v1 = GSVector4i::loadl(&cmd->vertices[1].x);
-        const GSVector4i rect = v0.min_i32(v1).xyxy(v0.max_i32(v1)).add32(GSVector4i::cxpr(0, 0, 1, 1));
-        const GSVector4i clamped_rect = rect.rintersect(m_clamped_drawing_area);
-
-        if (rect.width() > MAX_PRIMITIVE_WIDTH || rect.height() > MAX_PRIMITIVE_HEIGHT || clamped_rect.rempty())
-        {
-          DEBUG_LOG("Culling too-large/off-screen line: {},{} - {},{}", cmd->vertices[0].y, cmd->vertices[0].y,
-                    cmd->vertices[1].x, cmd->vertices[1].y);
-          return;
-        }
-
-        AddDrawLineTicks(clamped_rect, rc.shading_enable);
-
-        m_backend.PushCommand(cmd);
-      }
-      else
-      {
-        const u32 num_vertices = GetPolyLineVertexCount();
-
-        GPUBackendDrawLineCommand* cmd = m_backend.NewDrawLineCommand(num_vertices);
-        FillDrawCommand(cmd, m_render_command);
-
-        u32 buffer_pos = 0;
-        const GPUVertexPosition start_vp{m_blit_buffer[buffer_pos++]};
-        cmd->vertices[0].x = start_vp.x + m_drawing_offset.x;
-        cmd->vertices[0].y = start_vp.y + m_drawing_offset.y;
-        cmd->vertices[0].color = m_render_command.color_for_first_vertex;
-
-        const bool shaded = m_render_command.shading_enable;
-        for (u32 i = 1; i < num_vertices; i++)
-        {
-          cmd->vertices[i].color =
-            shaded ? (m_blit_buffer[buffer_pos++] & UINT32_C(0x00FFFFFF)) : m_render_command.color_for_first_vertex;
-          const GPUVertexPosition vp{m_blit_buffer[buffer_pos++]};
-          cmd->vertices[i].x = m_drawing_offset.x + vp.x;
-          cmd->vertices[i].y = m_drawing_offset.y + vp.y;
-
-          const GSVector4i v0 = GSVector4i::loadl(&cmd->vertices[0].x);
-          const GSVector4i v1 = GSVector4i::loadl(&cmd->vertices[1].x);
-          const GSVector4i rect = v0.min_i32(v1).xyxy(v0.max_i32(v1)).add32(GSVector4i::cxpr(0, 0, 1, 1));
-          const GSVector4i clamped_rect = rect.rintersect(m_clamped_drawing_area);
-
-          if (rect.width() > MAX_PRIMITIVE_WIDTH || rect.height() > MAX_PRIMITIVE_HEIGHT || clamped_rect.rempty())
-          {
-            DEBUG_LOG("Culling too-large/off-screen line: {},{} - {},{}", cmd->vertices[i - 1].x,
-                      cmd->vertices[i - 1].y, cmd->vertices[i].x, cmd->vertices[i].y);
-            return;
-          }
-          else
-          {
-            AddDrawLineTicks(clamped_rect, rc.shading_enable);
-          }
-        }
-
-        m_backend.PushCommand(cmd);
-      }
-    }
-    break;
-
-    default:
-      UnreachableCode();
-      break;
-  }
-}
-
-void GPU_SW::ReadVRAM(u32 x, u32 y, u32 width, u32 height)
-{
-  m_backend.Sync(false);
-}
-
-void GPU_SW::FillVRAM(u32 x, u32 y, u32 width, u32 height, u32 color)
-{
-  GPUBackendFillVRAMCommand* cmd = m_backend.NewFillVRAMCommand();
-  FillBackendCommandParameters(cmd);
-  cmd->x = static_cast<u16>(x);
-  cmd->y = static_cast<u16>(y);
-  cmd->width = static_cast<u16>(width);
-  cmd->height = static_cast<u16>(height);
-  cmd->color = color;
-  m_backend.PushCommand(cmd);
-}
-
-void GPU_SW::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, bool set_mask, bool check_mask)
-{
-  const u32 num_words = width * height;
-  GPUBackendUpdateVRAMCommand* cmd = m_backend.NewUpdateVRAMCommand(num_words);
-  FillBackendCommandParameters(cmd);
-  cmd->params.set_mask_while_drawing = set_mask;
-  cmd->params.check_mask_before_draw = check_mask;
-  cmd->x = static_cast<u16>(x);
-  cmd->y = static_cast<u16>(y);
-  cmd->width = static_cast<u16>(width);
-  cmd->height = static_cast<u16>(height);
-  std::memcpy(cmd->data, data, sizeof(u16) * num_words);
-  m_backend.PushCommand(cmd);
-}
-
-void GPU_SW::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 width, u32 height)
-{
-  GPUBackendCopyVRAMCommand* cmd = m_backend.NewCopyVRAMCommand();
-  FillBackendCommandParameters(cmd);
-  cmd->src_x = static_cast<u16>(src_x);
-  cmd->src_y = static_cast<u16>(src_y);
-  cmd->dst_x = static_cast<u16>(dst_x);
-  cmd->dst_y = static_cast<u16>(dst_y);
-  cmd->width = static_cast<u16>(width);
-  cmd->height = static_cast<u16>(height);
-  m_backend.PushCommand(cmd);
-}
-
-void GPU_SW::FlushRender()
-{
-}
-
-void GPU_SW::UpdateCLUT(GPUTexturePaletteReg reg, bool clut_is_8bit)
-{
-  GPUBackendUpdateCLUTCommand* cmd = m_backend.NewUpdateCLUTCommand();
-  FillBackendCommandParameters(cmd);
-  cmd->reg.bits = reg.bits;
-  cmd->clut_is_8bit = clut_is_8bit;
-  m_backend.PushCommand(cmd);
-}
-
-std::unique_ptr<GPU> GPU::CreateSoftwareRenderer()
-{
-  std::unique_ptr<GPU_SW> gpu(std::make_unique<GPU_SW>());
-  if (!gpu->Initialize())
-    return nullptr;
-
-  return gpu;
+  return std::make_unique<GPU_SW>();
 }

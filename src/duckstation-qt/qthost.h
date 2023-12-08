@@ -96,6 +96,8 @@ public:
   ALWAYS_INLINE bool isFullscreen() const { return m_is_fullscreen; }
   ALWAYS_INLINE bool isRenderingToMain() const { return m_is_rendering_to_main; }
   ALWAYS_INLINE bool isSurfaceless() const { return m_is_surfaceless; }
+
+  // TODO: Maybe remove this...
   ALWAYS_INLINE bool isRunningFullscreenUI() const { return m_run_fullscreen_ui; }
 
   std::optional<WindowInfo> acquireRenderWindow(bool recreate_window);

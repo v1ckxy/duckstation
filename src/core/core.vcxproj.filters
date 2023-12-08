@@ -46,7 +46,6 @@
     <ClCompile Include="analog_joystick.cpp" />
     <ClCompile Include="cpu_recompiler_code_generator_aarch32.cpp" />
     <ClCompile Include="gpu_backend.cpp" />
-    <ClCompile Include="gpu_sw_backend.cpp" />
     <ClCompile Include="texture_replacements.cpp" />
     <ClCompile Include="multitap.cpp" />
     <ClCompile Include="host.cpp" />
@@ -70,6 +69,7 @@
     <ClCompile Include="gdb_server.cpp" />
     <ClCompile Include="gpu_sw_rasterizer.cpp" />
     <ClCompile Include="gpu_sw_rasterizer_avx2.cpp" />
+    <ClCompile Include="gpu_thread.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="types.h" />
@@ -119,7 +119,6 @@
     <ClInclude Include="analog_joystick.h" />
     <ClInclude Include="gpu_types.h" />
     <ClInclude Include="gpu_backend.h" />
-    <ClInclude Include="gpu_sw_backend.h" />
     <ClInclude Include="texture_replacements.h" />
     <ClInclude Include="multitap.h" />
     <ClInclude Include="host.h" />
@@ -145,6 +144,7 @@
     <ClInclude Include="pine_server.h" />
     <ClInclude Include="gdb_server.h" />
     <ClInclude Include="gpu_sw_rasterizer.h" />
+    <ClInclude Include="gpu_thread.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="gpu_sw_rasterizer.inl" />

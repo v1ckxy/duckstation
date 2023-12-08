@@ -87,18 +87,6 @@ void DisplayLoadingScreen(const char* message, int progress_min = -1, int progre
 /// Safely executes a function on the VM thread.
 void RunOnCPUThread(std::function<void()> function, bool block = false);
 
-/// Attempts to create the rendering device backend.
-bool CreateGPUDevice(RenderAPI api, Error* error);
-
-/// Handles fullscreen transitions and such.
-void UpdateDisplayWindow();
-
-/// Called when the window is resized.
-void ResizeDisplayWindow(s32 width, s32 height, float scale);
-
-/// Destroys any active rendering device.
-void ReleaseGPUDevice();
-
 /// Called at the end of the frame, before presentation.
 void FrameDone();
 

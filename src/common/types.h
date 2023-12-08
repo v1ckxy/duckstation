@@ -26,6 +26,18 @@
 #define ALWAYS_INLINE_RELEASE ALWAYS_INLINE
 #endif
 
+// Avoid inline helper
+#ifndef NEVER_INLINE
+#if defined(_MSC_VER)
+#define NEVER_INLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define NEVER_INLINE __attribute__((noinline))
+#else
+#define NEVER_INLINE
+#endif
+#endif
+
+
 // unreferenced parameter macro
 #ifndef UNREFERENCED_VARIABLE
 #if defined(__GNUC__) || defined(__clang__) || defined(__EMSCRIPTEN__)

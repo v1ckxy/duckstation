@@ -104,7 +104,7 @@ struct Settings
   std::string gpu_adapter;
   u8 gpu_resolution_scale = 1;
   u8 gpu_multisamples = 1;
-  bool gpu_use_thread : 1 = true;
+  u8 gpu_max_queued_frames = 2;
   bool gpu_use_software_renderer_for_readbacks : 1 = false;
   bool gpu_threaded_presentation : 1 = DEFAULT_THREADED_PRESENTATION;
   bool gpu_use_debug_device : 1 = false;
@@ -457,6 +457,8 @@ struct Settings
   static constexpr ConsoleRegion DEFAULT_CONSOLE_REGION = ConsoleRegion::Auto;
   static constexpr float DEFAULT_GPU_PGXP_DEPTH_THRESHOLD = 300.0f;
   static constexpr float GPU_PGXP_DEPTH_THRESHOLD_SCALE = 4096.0f;
+  static constexpr u8 DEFAULT_GPU_MAX_QUEUED_FRAMES = 2; // TODO: Maybe lower? But that means fast CPU threads would
+                                                         // always stall, could be a problem for power management.
 
   // Prefer oldrec over newrec for now. Except on RISC-V, where there is no oldrec.
 #if defined(CPU_ARCH_RISCV64)
@@ -526,7 +528,9 @@ struct Settings
   static constexpr u16 DEFAULT_PINE_SLOT = 28011;
 };
 
-extern Settings g_settings;
+// TODO: Use smaller copy for GPU thread copy.
+extern Settings g_settings;     // CPU thread copy.
+extern Settings g_gpu_settings; // GPU thread copy.
 
 namespace EmuFolders {
 extern std::string AppRoot;

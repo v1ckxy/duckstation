@@ -232,10 +232,8 @@ float GetMaximumFrameTime();
 float GetThrottleFrequency();
 float GetCPUThreadUsage();
 float GetCPUThreadAverageTime();
-float GetSWThreadUsage();
-float GetSWThreadAverageTime();
-float GetGPUUsage();
-float GetGPUAverageTime();
+float GetGPUThreadUsage();
+float GetGPUThreadAverageTime();
 const FrameTimeHistory& GetFrameTimeHistory();
 u32 GetFrameTimeHistoryPos();
 void FormatLatencyStats(SmallStringBase& str);
@@ -299,6 +297,7 @@ void SetThrottleFrequency(float frequency);
 void UpdateThrottlePeriod();
 void ResetThrottler();
 void ResetPerformanceCounters();
+void GetFramePresentationDetails(bool* present_frame, bool* allow_present_skip, Common::Timer::Value* present_time);
 
 // Access controllers for simulating input.
 Controller* GetController(u32 slot);
@@ -478,10 +477,6 @@ void RequestDisplaySize(float scale = 0.0f);
 
 /// Call when host display size changes, use with "match display" aspect ratio setting.
 void HostDisplayResized();
-
-/// Renders the display.
-bool PresentDisplay(bool skip_present, bool explicit_present);
-void InvalidateDisplay();
 
 //////////////////////////////////////////////////////////////////////////
 // Memory Save States (Rewind and Runahead)

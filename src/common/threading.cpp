@@ -1,9 +1,16 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>, 2002-2023 PCSX2 Dev Team
+// SPDX-License-Identifier: LGPL-3.0
 
 #include "threading.h"
 #include "assert.h"
+#include "log.h"
+#include "timer.h"
+
 #include <memory>
+
+#if defined(CPU_ARCH_X86) || defined(CPU_ARCH_X64)
+#include <emmintrin.h>
+#endif
 
 #if !defined(_WIN32) && !defined(__APPLE__)
 #ifndef _GNU_SOURCE
@@ -14,6 +21,10 @@
 #if defined(_WIN32)
 #include "windows_headers.h"
 #include <process.h>
+
+#if defined(CPU_ARCH_ARM64) && defined(_MSC_VER)
+#include <arm64intr.h>
+#endif
 #else
 #include <pthread.h>
 #include <unistd.h>
@@ -37,6 +48,8 @@
 #include <pthread_np.h>
 #endif
 #endif
+
+Log_SetChannel(Threading);
 
 #ifdef _WIN32
 union FileTimeU64Union
@@ -100,6 +113,138 @@ void Threading::Timeslice()
   sched_yield();
 #endif
 }
+
+static void MultiPause()
+{
+#if defined(CPU_ARCH_X86) || defined(CPU_ARCH_X64)
+  _mm_pause();
+  _mm_pause();
+  _mm_pause();
+  _mm_pause();
+  _mm_pause();
+  _mm_pause();
+  _mm_pause();
+  _mm_pause();
+#elif defined(CPU_ARCH_ARM64) && defined(_MSC_VER)
+  __isb(_ARM64_BARRIER_SY);
+  __isb(_ARM64_BARRIER_SY);
+  __isb(_ARM64_BARRIER_SY);
+  __isb(_ARM64_BARRIER_SY);
+  __isb(_ARM64_BARRIER_SY);
+  __isb(_ARM64_BARRIER_SY);
+  __isb(_ARM64_BARRIER_SY);
+  __isb(_ARM64_BARRIER_SY);
+#elif defined(CPU_ARCH_ARM64) || defined(CPU_ARCH_ARM32)
+  __asm__ __volatile__("isb");
+  __asm__ __volatile__("isb");
+  __asm__ __volatile__("isb");
+  __asm__ __volatile__("isb");
+  __asm__ __volatile__("isb");
+  __asm__ __volatile__("isb");
+  __asm__ __volatile__("isb");
+  __asm__ __volatile__("isb");
+#elif defined(CPU_ARCH_RISCV64)
+  // Probably wrong... pause is optional :/
+  asm volatile("fence" ::: "memory");
+#else
+#pragma warning("Missing implementation")
+#endif
+}
+
+// Apple uses a lower tick frequency, so we can't use the dynamic loop below.
+#if !defined(_M_ARM64) || defined(__APPLE__) || defined(_WIN32)
+
+static u32 PAUSE_TIME = 0;
+
+static u32 MeasurePauseTime()
+{
+  // GetCPUTicks may have resolution as low as 1us
+  // One call to MultiPause could take anywhere from 20ns (fast Haswell) to 400ns (slow Skylake)
+  // We want a measurement of reasonable resolution, but don't want to take too long
+  // So start at a fairly small number and increase it if it's too fast
+  for (int testcnt = 64; true; testcnt *= 2)
+  {
+    Common::Timer::Value start = Common::Timer::GetCurrentValue();
+    for (int i = 0; i < testcnt; i++)
+    {
+      MultiPause();
+    }
+    Common::Timer::Value time = Common::Timer::GetCurrentValue() - start;
+    if (time > 100)
+    {
+      const double nanos = Common::Timer::ConvertValueToNanoseconds(time);
+      return static_cast<u32>((nanos / testcnt) + 1);
+    }
+  }
+}
+
+NEVER_INLINE static void UpdatePauseTime()
+{
+  Common::Timer::BusyWait(10000000);
+  u32 pause = MeasurePauseTime();
+  // Take a few measurements in case something weird happens during one
+  // (e.g. OS interrupt)
+  for (int i = 0; i < 4; i++)
+    pause = std::min(pause, MeasurePauseTime());
+  PAUSE_TIME = pause;
+  VERBOSE_LOG("MultiPause time: {}ns", pause);
+}
+
+u32 Threading::ShortSpin()
+{
+  u32 inc = PAUSE_TIME;
+  if (inc == 0) [[unlikely]]
+  {
+    UpdatePauseTime();
+    inc = PAUSE_TIME;
+  }
+
+  u32 time = 0;
+  // Sleep for approximately 500ns
+  for (; time < 500; time += inc)
+    MultiPause();
+
+  return time;
+}
+
+#else
+
+// On ARM, we have big/little cores, and who knows which one we'll measure/run on..
+// TODO: Actually verify this code.
+const u32 SHORT_SPIN_TIME_TICKS = static_cast<u32>((Common::Timer::GetFrequency() * 500) / 1000000000);
+
+u32 Threading::ShortSpin()
+{
+  const Common::Timer::Value start = Common::Timer::GetCurrentValue();
+  Common::Timer::Value now = start;
+  while ((now - start) < SHORT_SPIN_TIME_TICKS)
+  {
+    MultiPause();
+    now = Common::Timer::GetCurrentValue();
+  }
+
+  return static_cast<u32>((Common::Timer::GetCurrentValue() * (now - start)) / 1000000000);
+}
+
+#endif
+
+static u32 GetSpinTime()
+{
+  if (char* req = std::getenv("WAIT_SPIN_MICROSECONDS"))
+  {
+    return 1000 * atoi(req);
+  }
+  else
+  {
+#ifndef _M_ARM64
+    return 50 * 1000; // 50us
+#else
+    return 200 * 1000; // 200us
+#endif
+  }
+}
+
+const u32 Threading::SPIN_TIME_NS = GetSpinTime();
 
 Threading::ThreadHandle::ThreadHandle() = default;
 
@@ -616,4 +761,131 @@ bool Threading::KernelSemaphore::TryWait()
 #else
   return sem_trywait(&m_sema) == 0;
 #endif
+}
+
+bool Threading::WorkSema::CheckForWork()
+{
+  s32 value = m_state.load(std::memory_order_relaxed);
+  DebugAssert(!IsDead(value));
+
+  // we want to switch to the running state, but preserve the waiting empty bit for RUNNING_N -> RUNNING_0
+  // otherwise, we clear the waiting flag (since we're notifying the waiter that we're empty below)
+  while (!m_state.compare_exchange_weak(value,
+                                        IsReadyForSleep(value) ? STATE_RUNNING_0 : (value & STATE_FLAG_WAITING_EMPTY),
+                                        std::memory_order_acq_rel, std::memory_order_relaxed))
+  {
+  }
+
+  // if we're not empty, we have work to do
+  if (!IsReadyForSleep(value))
+    return true;
+
+  // this means we're empty, so notify any waiters
+  if (value & STATE_FLAG_WAITING_EMPTY)
+    m_empty_sema.Post();
+
+  // no work to do
+  return false;
+}
+
+void Threading::WorkSema::WaitForWork()
+{
+  // State change:
+  // SLEEPING, SPINNING: This is the worker thread and it's clearly not asleep or spinning, so these states should be
+  // impossible RUNNING_0: Change state to SLEEPING, wake up thread if WAITING_EMPTY RUNNING_N: Change state to
+  // RUNNING_0 (and preserve WAITING_EMPTY flag)
+  s32 value = m_state.load(std::memory_order_relaxed);
+  DebugAssert(!IsDead(value));
+  while (!m_state.compare_exchange_weak(value, NextStateWaitForWork(value), std::memory_order_acq_rel,
+                                        std::memory_order_relaxed))
+    ;
+  if (IsReadyForSleep(value))
+  {
+    if (value & STATE_FLAG_WAITING_EMPTY)
+      m_empty_sema.Post();
+    m_sema.Wait();
+    // Acknowledge any additional work added between wake up request and getting here
+    m_state.fetch_and(STATE_FLAG_WAITING_EMPTY, std::memory_order_acquire);
+  }
+}
+
+void Threading::WorkSema::WaitForWorkWithSpin()
+{
+  s32 value = m_state.load(std::memory_order_relaxed);
+  DebugAssert(!IsDead(value));
+  while (IsReadyForSleep(value))
+  {
+    if (m_state.compare_exchange_weak(value, STATE_SPINNING, std::memory_order_release, std::memory_order_relaxed))
+    {
+      if (value & STATE_FLAG_WAITING_EMPTY)
+        m_empty_sema.Post();
+      value = STATE_SPINNING;
+      break;
+    }
+  }
+  u32 waited = 0;
+  while (value < 0)
+  {
+    if (waited > SPIN_TIME_NS)
+    {
+      if (!m_state.compare_exchange_weak(value, STATE_SLEEPING, std::memory_order_relaxed))
+        continue;
+      m_sema.Wait();
+      break;
+    }
+    waited += ShortSpin();
+    value = m_state.load(std::memory_order_relaxed);
+  }
+  // Clear back to STATE_RUNNING_0 (but preserve waiting empty flag)
+  m_state.fetch_and(STATE_FLAG_WAITING_EMPTY, std::memory_order_acquire);
+}
+
+bool Threading::WorkSema::WaitForEmpty()
+{
+  s32 value = m_state.load(std::memory_order_acquire);
+  while (true)
+  {
+    if (value < 0)
+      return !IsDead(value); // STATE_SLEEPING or STATE_SPINNING, queue is empty!
+    // Note: We technically only need memory_order_acquire on *failure* (because that's when we could leave without
+    // sleeping), but libstdc++ still asserts on failure < success
+    if (m_state.compare_exchange_weak(value, value | STATE_FLAG_WAITING_EMPTY, std::memory_order_acquire))
+      break;
+  }
+  DebugAssertMsg(!(value & STATE_FLAG_WAITING_EMPTY),
+                 "Multiple threads attempted to wait for empty (not currently supported)");
+  m_empty_sema.Wait();
+  return !IsDead(m_state.load(std::memory_order_relaxed));
+}
+
+bool Threading::WorkSema::WaitForEmptyWithSpin()
+{
+  s32 value = m_state.load(std::memory_order_acquire);
+  u32 waited = 0;
+  while (true)
+  {
+    if (value < 0)
+      return !IsDead(value); // STATE_SLEEPING or STATE_SPINNING, queue is empty!
+    if (waited > SPIN_TIME_NS &&
+        m_state.compare_exchange_weak(value, value | STATE_FLAG_WAITING_EMPTY, std::memory_order_acquire))
+      break;
+    waited += ShortSpin();
+    value = m_state.load(std::memory_order_acquire);
+  }
+  DebugAssertMsg(!(value & STATE_FLAG_WAITING_EMPTY),
+                 "Multiple threads attempted to wait for empty (not currently supported)");
+  m_empty_sema.Wait();
+  return !IsDead(m_state.load(std::memory_order_relaxed));
+}
+
+void Threading::WorkSema::Kill()
+{
+  s32 value = m_state.exchange(std::numeric_limits<s32>::min(), std::memory_order_release);
+  if (value & STATE_FLAG_WAITING_EMPTY)
+    m_empty_sema.Post();
+}
+
+void Threading::WorkSema::Reset()
+{
+  m_state = STATE_RUNNING_0;
 }

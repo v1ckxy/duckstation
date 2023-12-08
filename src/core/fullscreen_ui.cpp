@@ -12,6 +12,7 @@
 #include "cpu_core.h"
 #include "game_list.h"
 #include "gpu.h"
+#include "gpu_thread.h"
 #include "host.h"
 #include "resources.h"
 #include "settings.h"
@@ -594,6 +595,7 @@ bool FullscreenUI::Initialize()
   s_was_paused_on_quick_menu_open = false;
   s_about_window_open = false;
   s_hotkey_list_cache = InputManager::GetHotkeyList();
+  GPUThread::SetRunIdle(true);
 
   if (!System::IsValid())
     SwitchToLanding();
@@ -624,6 +626,7 @@ bool FullscreenUI::AreAnyDialogsOpen()
 
 void FullscreenUI::CheckForConfigChanges(const Settings& old_settings)
 {
+  // NOTE: Called on CPU thread.
   if (!IsInitialized())
     return;
 
@@ -631,54 +634,114 @@ void FullscreenUI::CheckForConfigChanges(const Settings& old_settings)
   // That means we're going to be reading achievement state.
   if (old_settings.achievements_enabled && !g_settings.achievements_enabled)
   {
-    if (s_current_main_window == MainWindowType::Achievements || s_current_main_window == MainWindowType::Leaderboards)
-      ReturnToPreviousWindow();
+    if (!IsInitialized())
+      return;
+
+    GPUThread::RunOnThread([]() {
+      if (s_current_main_window == MainWindowType::Achievements ||
+          s_current_main_window == MainWindowType::Leaderboards)
+      {
+        ReturnToPreviousWindow();
+      }
+    });
   }
 }
 
 void FullscreenUI::OnSystemStarted()
 {
+  // NOTE: Called on CPU thread.
   if (!IsInitialized())
     return;
 
-  s_current_main_window = MainWindowType::None;
-  QueueResetFocus();
+  GPUThread::RunOnThread([]() {
+    if (!IsInitialized())
+      return;
+
+    GPUThread::SetRunIdle(false);
+
+    s_current_main_window = MainWindowType::None;
+    QueueResetFocus();
+  });
 }
 
 void FullscreenUI::OnSystemPaused()
 {
-  // noop
+  // NOTE: Called on CPU thread.
+  if (!IsInitialized())
+    return;
+
+  GPUThread::RunOnThread([]() {
+    if (!IsInitialized())
+      return;
+
+    GPUThread::SetRunIdle(true);
+  });
 }
 
 void FullscreenUI::OnSystemResumed()
 {
-  // get rid of pause menu if we unpaused another way
-  if (s_current_main_window == MainWindowType::PauseMenu)
-    ClosePauseMenu();
+  // NOTE: Called on CPU thread.
+  if (!IsInitialized())
+    return;
+
+  GPUThread::RunOnThread([]() {
+    if (!IsInitialized())
+      return;
+
+    GPUThread::SetRunIdle(false);
+
+    // get rid of pause menu if we unpaused another way
+    if (s_current_main_window == MainWindowType::PauseMenu)
+      ClosePauseMenu();
+  });
 }
 
 void FullscreenUI::OnSystemDestroyed()
 {
+  // NOTE: Called on CPU thread.
   if (!IsInitialized())
     return;
 
-  s_pause_menu_was_open = false;
-  s_was_paused_on_quick_menu_open = false;
-  s_current_pause_submenu = PauseSubMenu::None;
-  SwitchToLanding();
+  GPUThread::RunOnThread([]() {
+    if (!IsInitialized())
+      return;
+
+    // If we didn't start big picture before the system, shut ourselves down.
+    if (!GPUThread::WasFullscreenUIRequested())
+    {
+      Shutdown();
+      return;
+    }
+
+    GPUThread::SetRunIdle(true);
+    s_pause_menu_was_open = false;
+    s_was_paused_on_quick_menu_open = false;
+    s_current_pause_submenu = PauseSubMenu::None;
+    SwitchToLanding();
+  });
 }
 
 void FullscreenUI::OnRunningGameChanged()
 {
+  // NOTE: Called on CPU thread.
   if (!IsInitialized())
     return;
 
   const std::string& path = System::GetDiscPath();
   const std::string& serial = System::GetGameSerial();
+
+  std::string subtitle;
   if (!serial.empty())
-    s_current_game_subtitle = fmt::format("{0} - {1}", serial, Path::GetFileName(path));
+    subtitle = fmt::format("{0} - {1}", serial, Path::GetFileName(path));
   else
-    s_current_game_subtitle = {};
+    subtitle = {};
+
+  GPUThread::RunOnThread([subtitle = std::move(subtitle)]() mutable {
+    if (!IsInitialized())
+      return;
+
+    s_current_game_subtitle = std::move(subtitle);
+  });
 }
 
 void FullscreenUI::PauseForMenuOpen(bool set_pause_menu_open)
@@ -695,15 +758,17 @@ void FullscreenUI::OpenPauseMenu()
   if (!System::IsValid())
     return;
 
-  if (!Initialize() || s_current_main_window != MainWindowType::None)
-    return;
+  GPUThread::RunOnThread([]() {
+    if (!Initialize() || s_current_main_window != MainWindowType::None)
+      return;
 
-  PauseForMenuOpen(true);
-  s_current_main_window = MainWindowType::PauseMenu;
-  s_current_pause_submenu = PauseSubMenu::None;
-  QueueResetFocus();
-  ForceKeyNavEnabled();
-  FixStateIfPaused();
+    PauseForMenuOpen(true);
+    s_current_main_window = MainWindowType::PauseMenu;
+    s_current_pause_submenu = PauseSubMenu::None;
+    QueueResetFocus();
+    ForceKeyNavEnabled();
+    FixStateIfPaused();
+  });
 }
 
 void FullscreenUI::FixStateIfPaused()
@@ -713,31 +778,26 @@ void FullscreenUI::FixStateIfPaused()
 
   // When we're paused, we won't have trickled the key up event for escape yet. Do it now.
   ImGui::UpdateInputEvents(false);
-
-  Host::OnIdleStateChanged();
-  Host::RunOnCPUThread([]() {
-    if (System::IsValid())
-    {
-      // Why twice? To clear the "wants keyboard input" flag.
-      System::InvalidateDisplay();
-      System::InvalidateDisplay();
-    }
-  });
 }
 
 void FullscreenUI::ClosePauseMenu()
 {
-  if (!IsInitialized() || !System::IsValid())
+  if (!System::IsValid())
     return;
 
-  if (System::GetState() == System::State::Paused && !s_was_paused_on_quick_menu_open)
-    Host::RunOnCPUThread([]() { System::PauseSystem(false); });
+  GPUThread::RunOnThread([]() {
+    if (!IsInitialized())
+      return;
 
-  s_current_main_window = MainWindowType::None;
-  s_current_pause_submenu = PauseSubMenu::None;
-  s_pause_menu_was_open = false;
-  QueueResetFocus();
-  FixStateIfPaused();
+    if (System::GetState() == System::State::Paused && !s_was_paused_on_quick_menu_open)
+      Host::RunOnCPUThread([]() { System::PauseSystem(false); });
+
+    s_current_main_window = MainWindowType::None;
+    s_current_pause_submenu = PauseSubMenu::None;
+    s_pause_menu_was_open = false;
+    QueueResetFocus();
+    FixStateIfPaused();
+  });
 }
 
 void FullscreenUI::OpenPauseSubMenu(PauseSubMenu submenu)
@@ -749,6 +809,8 @@ void FullscreenUI::OpenPauseSubMenu(PauseSubMenu submenu)
 
 void FullscreenUI::Shutdown()
 {
+  GPUThread::SetRunIdle(false);
+
   Achievements::ClearUIState();
   CloseSaveStateSelector();
   s_cover_image_map.clear();
@@ -1135,152 +1197,166 @@ void FullscreenUI::DoChangeDiscFromFile()
 
 void FullscreenUI::DoChangeDisc()
 {
-  ImGuiFullscreen::ChoiceDialogOptions options;
+  Host::RunOnCPUThread([]() {
+    ImGuiFullscreen::ChoiceDialogOptions options;
 
-  if (System::HasMediaSubImages())
-  {
-    const u32 current_index = System::GetMediaSubImageIndex();
-    const u32 count = System::GetMediaSubImageCount();
-    options.reserve(count + 1);
-    options.emplace_back(FSUI_STR("From File..."), false);
-
-    for (u32 i = 0; i < count; i++)
-      options.emplace_back(System::GetMediaSubImageTitle(i), i == current_index);
-
-    auto callback = [](s32 index, const std::string& title, bool checked) {
-      if (index == 0)
-      {
-        CloseChoiceDialog();
-        DoChangeDiscFromFile();
-        return;
-      }
-      else if (index > 0)
-      {
-        System::SwitchMediaSubImage(static_cast<u32>(index - 1));
-      }
-
-      QueueResetFocus();
-      CloseChoiceDialog();
-      ReturnToPreviousWindow();
-    };
-
-    OpenChoiceDialog(FSUI_ICONSTR(ICON_FA_COMPACT_DISC, "Select Disc Image"), true, std::move(options),
-                     std::move(callback));
-
-    return;
-  }
-
-  if (const GameDatabase::Entry* entry = System::GetGameDatabaseEntry(); entry && !entry->disc_set_serials.empty())
-  {
-    const auto lock = GameList::GetLock();
-    const auto matches = GameList::GetMatchingEntriesForSerial(entry->disc_set_serials);
-    if (matches.size() > 1)
+    if (System::HasMediaSubImages())
     {
-      options.reserve(matches.size() + 1);
+      const u32 current_index = System::GetMediaSubImageIndex();
+      const u32 count = System::GetMediaSubImageCount();
+      options.reserve(count + 1);
       options.emplace_back(FSUI_STR("From File..."), false);
 
-      std::vector<std::string> paths;
-      paths.reserve(matches.size());
+      for (u32 i = 0; i < count; i++)
+        options.emplace_back(System::GetMediaSubImageTitle(i), i == current_index);
 
-      const std::string& current_path = System::GetDiscPath();
-      for (auto& [title, glentry] : matches)
-      {
-        options.emplace_back(std::move(title), current_path == glentry->path);
-        paths.push_back(glentry->path);
-      }
+      GPUThread::RunOnThread([options = std::move(options)]() mutable {
+        auto callback = [](s32 index, const std::string& title, bool checked) {
+          if (index == 0)
+          {
+            CloseChoiceDialog();
+            DoChangeDiscFromFile();
+            return;
+          }
+          else if (index > 0)
+          {
+            Host::RunOnCPUThread([index = static_cast<u32>(index - 1)]() { System::SwitchMediaSubImage(index); });
+          }
 
-      auto callback = [paths = std::move(paths)](s32 index, const std::string& title, bool checked) {
-        if (index == 0)
-        {
+          QueueResetFocus();
           CloseChoiceDialog();
-          DoChangeDiscFromFile();
-          return;
-        }
-        else if (index > 0)
-        {
-          System::InsertMedia(paths[index - 1].c_str());
-        }
+          ReturnToPreviousWindow();
+        };
 
-        QueueResetFocus();
-        CloseChoiceDialog();
-        ReturnToMainWindow();
-      };
-
-      OpenChoiceDialog(FSUI_ICONSTR(ICON_FA_COMPACT_DISC, "Select Disc Image"), true, std::move(options),
-                       std::move(callback));
+        OpenChoiceDialog(FSUI_ICONSTR(ICON_FA_COMPACT_DISC, "Select Disc Image"), true, std::move(options),
+                         std::move(callback));
+      });
 
       return;
     }
-  }
 
-  DoChangeDiscFromFile();
+    if (const GameDatabase::Entry* entry = System::GetGameDatabaseEntry(); entry && !entry->disc_set_serials.empty())
+    {
+      const auto lock = GameList::GetLock();
+      const auto matches = GameList::GetMatchingEntriesForSerial(entry->disc_set_serials);
+      if (matches.size() > 1)
+      {
+        options.reserve(matches.size() + 1);
+        options.emplace_back(FSUI_STR("From File..."), false);
+
+        std::vector<std::string> paths;
+        paths.reserve(matches.size());
+
+        const std::string& current_path = System::GetDiscPath();
+        for (auto& [title, glentry] : matches)
+        {
+          options.emplace_back(std::move(title), current_path == glentry->path);
+          paths.push_back(glentry->path);
+        }
+
+        GPUThread::RunOnThread([options = std::move(options), paths = std::move(paths)]() mutable {
+          auto callback = [paths = std::move(paths)](s32 index, const std::string& title, bool checked) {
+            if (index == 0)
+            {
+              CloseChoiceDialog();
+              DoChangeDiscFromFile();
+              return;
+            }
+            else if (index > 0)
+            {
+              Host::RunOnCPUThread([path = std::move(paths[index - 1])]() { System::InsertMedia(path.c_str()); });
+            }
+
+            QueueResetFocus();
+            CloseChoiceDialog();
+            ReturnToMainWindow();
+          };
+
+          OpenChoiceDialog(FSUI_ICONSTR(ICON_FA_COMPACT_DISC, "Select Disc Image"), true, std::move(options),
+                           std::move(callback));
+        });
+
+        return;
+      }
+    }
+
+    GPUThread::RunOnThread([]() { DoChangeDiscFromFile(); });
+  });
 }
 
 void FullscreenUI::DoCheatsMenu()
 {
-  CheatList* cl = System::GetCheatList();
-  if (!cl)
-  {
-    if (!System::LoadCheatListFromDatabase() || ((cl = System::GetCheatList()) == nullptr))
-    {
-      Host::AddKeyedOSDMessage("load_cheat_list",
-                               fmt::format(FSUI_FSTR("No cheats found for {}."), System::GetGameTitle()), 10.0f);
-      ReturnToPreviousWindow();
-      return;
-    }
-  }
-
-  ImGuiFullscreen::ChoiceDialogOptions options;
-  options.reserve(cl->GetCodeCount());
-  for (u32 i = 0; i < cl->GetCodeCount(); i++)
-  {
-    const CheatCode& cc = cl->GetCode(i);
-    options.emplace_back(cc.description.c_str(), cc.enabled);
-  }
-
-  auto callback = [](s32 index, const std::string& title, bool checked) {
-    if (index < 0)
-    {
-      ReturnToPreviousWindow();
-      return;
-    }
-
+  Host::RunOnCPUThread([]() {
     CheatList* cl = System::GetCheatList();
     if (!cl)
-      return;
+    {
+      if (!System::LoadCheatListFromDatabase() || ((cl = System::GetCheatList()) == nullptr))
+      {
+        Host::AddKeyedOSDMessage("load_cheat_list",
+                                 fmt::format(FSUI_FSTR("No cheats found for {}."), System::GetGameTitle()), 10.0f);
+        ReturnToPreviousWindow();
+        return;
+      }
+    }
 
-    const CheatCode& cc = cl->GetCode(static_cast<u32>(index));
-    if (cc.activation == CheatCode::Activation::Manual)
-      cl->ApplyCode(static_cast<u32>(index));
-    else
-      System::SetCheatCodeState(static_cast<u32>(index), checked);
-  };
-  OpenChoiceDialog(FSUI_ICONSTR(ICON_FA_FROWN, "Cheat List"), true, std::move(options), std::move(callback));
+    ImGuiFullscreen::ChoiceDialogOptions options;
+    options.reserve(cl->GetCodeCount());
+    for (u32 i = 0; i < cl->GetCodeCount(); i++)
+    {
+      const CheatCode& cc = cl->GetCode(i);
+      options.emplace_back(cc.description.c_str(), cc.enabled);
+    }
+
+    GPUThread::RunOnThread([options = std::move(options)]() mutable {
+      auto callback = [](s32 index, const std::string& title, bool checked) {
+        if (index < 0)
+        {
+          ReturnToPreviousWindow();
+          return;
+        }
+
+        Host::RunOnCPUThread([index, checked]() {
+          CheatList* cl = System::GetCheatList();
+          if (!cl)
+            return;
+
+          const CheatCode& cc = cl->GetCode(static_cast<u32>(index));
+          if (cc.activation == CheatCode::Activation::Manual)
+            cl->ApplyCode(static_cast<u32>(index));
+          else
+            System::SetCheatCodeState(static_cast<u32>(index), checked);
+        });
+      };
+      OpenChoiceDialog(FSUI_ICONSTR(ICON_FA_FROWN, "Cheat List"), true, std::move(options), std::move(callback));
+    });
+  });
 }
 
 void FullscreenUI::DoToggleAnalogMode()
 {
   // hacky way to toggle analog mode
-  for (u32 i = 0; i < NUM_CONTROLLER_AND_CARD_PORTS; i++)
-  {
-    Controller* ctrl = System::GetController(i);
-    if (!ctrl)
-      continue;
-
-    const Controller::ControllerInfo* cinfo = Controller::GetControllerInfo(ctrl->GetType());
-    if (!cinfo)
-      continue;
-
-    for (const Controller::ControllerBindingInfo& bi : cinfo->bindings)
+  Host::RunOnCPUThread([]() {
+    for (u32 i = 0; i < NUM_CONTROLLER_AND_CARD_PORTS; i++)
     {
-      if (std::strcmp(bi.name, "Analog") == 0)
+      Controller* ctrl = System::GetController(i);
+      if (!ctrl)
+        continue;
+
+      const Controller::ControllerInfo* cinfo = Controller::GetControllerInfo(ctrl->GetType());
+      if (!cinfo)
+        continue;
+
+      for (const Controller::ControllerBindingInfo& bi : cinfo->bindings)
       {
-        ctrl->SetBindState(bi.bind_index, 1.0f);
-        ctrl->SetBindState(bi.bind_index, 0.0f);
-        break;
+        if (std::strcmp(bi.name, "Analog") == 0)
+        {
+          ctrl->SetBindState(bi.bind_index, 1.0f);
+          ctrl->SetBindState(bi.bind_index, 0.0f);
+          break;
+        }
       }
     }
-  }
+  });
 }
 
 void FullscreenUI::DoRequestExit()
@@ -3720,12 +3796,9 @@ void FullscreenUI::DrawControllerSettingsPage()
                   &Settings::GetMultitapModeName, &Settings::GetMultitapModeDisplayName, MultitapMode::Count);
 
   // load mtap settings
-  MultitapMode mtap_mode = g_settings.multitap_mode;
-  if (IsEditingGameSettings(bsi))
-  {
-    mtap_mode = Settings::ParseMultitapModeName(bsi->GetTinyStringValue("ControllerPorts", "MultitapMode", "").c_str())
-                  .value_or(g_settings.multitap_mode);
-  }
+  const MultitapMode mtap_mode =
+    Settings::ParseMultitapModeName(bsi->GetTinyStringValue("ControllerPorts", "MultitapMode", "").c_str())
+      .value_or(Settings::DEFAULT_MULTITAP_MODE);
   const std::array<bool, 2> mtap_enabled = {
     {(mtap_mode == MultitapMode::Port1Only || mtap_mode == MultitapMode::BothPorts),
      (mtap_mode == MultitapMode::Port2Only || mtap_mode == MultitapMode::BothPorts)}};
@@ -7076,31 +7149,35 @@ void FullscreenUI::DrawAboutWindow()
 
 void FullscreenUI::OpenAchievementsWindow()
 {
+  if (!System::IsValid())
+    return;
+
   if (!Achievements::IsActive())
   {
     Host::AddKeyedOSDMessage("achievements_disabled", FSUI_STR("Achievements are not enabled."),
                              Host::OSD_INFO_DURATION);
     return;
   }
-
-  if (!System::IsValid() || !Initialize())
-    return;
-
-  if (!Achievements::HasAchievements() || !Achievements::PrepareAchievementsWindow())
+  else if (!Achievements::HasAchievements())
   {
     ShowToast(std::string(), FSUI_STR("This game has no achievements."));
     return;
   }
 
-  if (s_current_main_window != MainWindowType::PauseMenu)
-  {
-    PauseForMenuOpen(false);
-    ForceKeyNavEnabled();
-  }
+  GPUThread::RunOnThread([]() {
+    if (!Initialize() || !Achievements::PrepareAchievementsWindow())
+      return;
 
-  s_current_main_window = MainWindowType::Achievements;
-  QueueResetFocus();
-  FixStateIfPaused();
+    if (s_current_main_window != MainWindowType::PauseMenu)
+    {
+      PauseForMenuOpen(false);
+      ForceKeyNavEnabled();
+    }
+
+    s_current_main_window = MainWindowType::Achievements;
+    QueueResetFocus();
+    FixStateIfPaused();
+  });
 }
 
 bool FullscreenUI::IsAchievementsWindowOpen()
@@ -7110,31 +7187,35 @@ bool FullscreenUI::IsAchievementsWindowOpen()
 
 void FullscreenUI::OpenLeaderboardsWindow()
 {
+  if (!System::IsValid())
+    return;
+
   if (!Achievements::IsActive())
   {
     Host::AddKeyedOSDMessage("achievements_disabled", FSUI_STR("Leaderboards are not enabled."),
                              Host::OSD_INFO_DURATION);
     return;
   }
-
-  if (!System::IsValid() || !Initialize())
-    return;
-
-  if (!Achievements::HasLeaderboards() || !Achievements::PrepareLeaderboardsWindow())
+  else if (!Achievements::HasLeaderboards())
   {
     ShowToast(std::string(), FSUI_STR("This game has no leaderboards."));
     return;
   }
 
-  if (s_current_main_window != MainWindowType::PauseMenu)
-  {
-    PauseForMenuOpen(false);
-    ForceKeyNavEnabled();
-  }
+  GPUThread::RunOnThread([]() {
+    if (!Initialize() || !Achievements::PrepareLeaderboardsWindow())
+      return;
 
-  s_current_main_window = MainWindowType::Leaderboards;
-  QueueResetFocus();
-  FixStateIfPaused();
+    if (s_current_main_window != MainWindowType::PauseMenu)
+    {
+      PauseForMenuOpen(false);
+      ForceKeyNavEnabled();
+    }
+
+    s_current_main_window = MainWindowType::Leaderboards;
+    QueueResetFocus();
+    FixStateIfPaused();
+  });
 }
 
 bool FullscreenUI::IsLeaderboardsWindowOpen()
