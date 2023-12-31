@@ -145,6 +145,7 @@ set(SRCS
   setupwizarddialog.cpp
   setupwizarddialog.h
   setupwizarddialog.ui
+  texturereplacementsettingsdialog.ui
 )
 
 set(TS_FILES
